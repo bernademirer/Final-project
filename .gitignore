@@ -1,4 +1,7 @@
 .venv/
 data/images/
+data/yolo/images/
 __pycache__/
 .DS_Store
+results/*.pt
+runs/
