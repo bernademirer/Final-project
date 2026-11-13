@@ -40,6 +40,19 @@ def main() -> None:
     weights = Path(args.weights)
     if not weights.is_absolute():
         weights = ROOT / weights
+    if not weights.is_file():
+        found = sorted(
+            (ROOT / "runs" / "detect").glob("*/weights/best.pt"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not found:
+            raise SystemExit(
+                "YOLO agirligi yok. runs/detect altinda best.pt bulunamadi. "
+                "Sayim egitimi silmez; egitim hucresini yeniden calistir."
+            )
+        weights.parent.mkdir(parents=True, exist_ok=True)
+        weights.write_bytes(found[-1].read_bytes())
+        print("agirlik kopyalandi", found[-1])
     model = YOLO(str(weights))
     data = ROOT / "data" / "yolo" / "data.yaml"
     metrics = model.val(data=str(data), split="test", imgsz=640, batch=16, verbose=False)

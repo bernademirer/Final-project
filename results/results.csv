@@ -1,6 +1,6 @@
 model,dogruluk,macro_f1,recall_0,recall_1,recall_2,recall_3,epoch,sure_dk
 resnet50,,,,,,,,
-efficientnet_b0,,,,,,,,
+efficientnet_b0,0.7740,0.7509,0.8058,0.7874,0.5556,0.8846,10,24.47
 kazanan_aug_off,,,,,,,,
-yolov8n,,,,,,,,
-yolov8n_sayimdan_siddet,,,,,,,,
+yolov8n,0.3118,,,,,,50,0.00
+yolov8n_sayimdan_siddet,0.3836,0.1712,1.0000,0.0709,0.0000,0.0000,50,0.00
