@@ -1,78 +1,93 @@
-import pandas as pd
+"""Hoca notunun iki figurunu uretir.
+
+    python src/sekiller.py
+
+results/results.csv okunur. Sayisi olmayan satir grafige girmez (0 diye cizilmez).
+Karisiklik figurunde dosyasi olmayan panel bos kalir. Betik her durumda hatasiz biter.
+"""
+
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os
+import pandas as pd
 from PIL import Image
 
-# 1. Macro-F1 Çubuğu Grafiği
-try:
-    # CSV dosyasını oku
-    df = pd.read_csv('results/results.csv')
-    
-    # İstenen modelleri filtrele (yolov8n bu grafikte olmamalı)
-    istenen_modeller = ['resnet50', 'efficientnet_b0', 'kazanan_aug_off', 'yolov8n_sayimdan_siddet']
-    df_filtered = df[df['model'].isin(istenen_modeller)].copy()
+ROOT = Path(__file__).resolve().parents[1]
+RESULTS = ROOT / "results"
 
-    # Sayı olmayan (boş) değerleri 0 kabul et ki kod çökmesin
-    df_filtered['macro_f1'] = pd.to_numeric(df_filtered['macro_f1'], errors='coerce').fillna(0)
+# Sira ve renk modele bagli; bir satir eksik olsa da digerlerinin rengi kaymaz.
+# yolov8n bilerek yok: o satirdaki sayi mAP@0.5'tir, macro-F1 degildir.
+MODELLER = {
+    "resnet50": "skyblue",
+    "efficientnet_b0": "lightgreen",
+    "kazanan_aug_off": "salmon",
+    "yolov8n_sayimdan_siddet": "orchid",
+}
 
-    # Çubuk grafiği çizimi
-    plt.figure(figsize=(10, 6))
-    renkler = ['skyblue', 'lightgreen', 'salmon', 'orchid']
-    bars = plt.bar(df_filtered['model'], df_filtered['macro_f1'], color=renkler[:len(df_filtered)])
-    
-    plt.ylim(0, 1.1)
-    plt.ylabel('Macro-F1 Skoru')
-    plt.title('Modellerin Macro-F1 Karşılaştırması')
-    plt.xticks(rotation=15)
 
-    # Barların üzerine değerlerini yazdır
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.4f}", ha='center', va='bottom')
+def macro_f1_figuru() -> None:
+    csv_yolu = RESULTS / "results.csv"
+    if not csv_yolu.exists():
+        print("results.csv yok, sekil_macro_f1.png atlandi.")
+        return
+    df = pd.read_csv(csv_yolu)
+    df = df[df["model"].isin(MODELLER)].copy()
+    df["macro_f1"] = pd.to_numeric(df["macro_f1"], errors="coerce")
+    df = df.dropna(subset=["macro_f1"])
+    df["sira"] = df["model"].map(list(MODELLER).index)
+    df = df.sort_values("sira")
 
-    plt.tight_layout()
-    plt.savefig('results/sekil_macro_f1.png')
-    plt.close()
-    print("sekil_macro_f1.png basariyla olusturuldu (Bos/Sifir verilerle).")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if df.empty:
+        ax.text(0.5, 0.5, "Henuz macro-F1 sayisi yok", ha="center", va="center", transform=ax.transAxes)
+    else:
+        bars = ax.bar(df["model"], df["macro_f1"], color=[MODELLER[m] for m in df["model"]])
+        for bar in bars:
+            y = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, y + 0.02, f"{y:.4f}", ha="center", va="bottom")
+    eksik = [m for m in MODELLER if m not in set(df["model"])]
+    if eksik:
+        ax.set_xlabel("Bekleniyor: " + ", ".join(eksik), fontsize=9, color="gray")
+    ax.set_ylim(0, 1.1)
+    ax.set_ylabel("Test macro-F1")
+    ax.set_title("Modellerin macro-F1 karsilastirmasi (test, fold 0)")
+    plt.setp(ax.get_xticklabels(), rotation=15)
+    fig.tight_layout()
+    fig.savefig(RESULTS / "sekil_macro_f1.png", dpi=120)
+    plt.close(fig)
+    print(f"sekil_macro_f1.png yazildi. Cizilen: {list(df['model'])}. Eksik: {eksik}")
 
-except Exception as e:
-    print(f"Macro-F1 grafikleri cizilirken hata: {e}")
 
-# 2. Karışıklık Matrislerini Yan Yana Basma
-try:
+def karisiklik_figuru() -> None:
+    kazanan_yolu = RESULTS / "kazanan.txt"
+    kazanan = kazanan_yolu.read_text(encoding="utf-8").strip() if kazanan_yolu.exists() else None
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    paneller = [
+        ("Artirmali (kazanan)", f"cm_{kazanan}.png" if kazanan else None),
+        ("Artirmasiz (aug_off)", f"cm_{kazanan}_aug_off.png" if kazanan else None),
+    ]
+    for ax, (baslik, ad) in zip(axes, paneller):
+        ax.axis("off")
+        if ad and (RESULTS / ad).exists():
+            ax.imshow(Image.open(RESULTS / ad))
+            ax.set_title(f"{baslik}\n{ad}")
+        else:
+            mesaj = f"results/{ad}\nbekleniyor" if ad else "results/kazanan.txt\nbekleniyor"
+            ax.text(0.5, 0.5, mesaj, ha="center", va="center")
+            ax.set_title(baslik)
+    fig.tight_layout()
+    fig.savefig(RESULTS / "sekil_karisiklik.png", dpi=120)
+    plt.close(fig)
+    print(f"sekil_karisiklik.png yazildi. Kazanan: {kazanan or 'henuz yok'}")
 
-    # Kazanan model txt'si gelmediyse varsayılan olarak resnet50 arayalım
-    kazanan_model = "resnet50"
-    if os.path.exists('results/kazanan.txt'):
-        with open('results/kazanan.txt', 'r') as f:
-            kazanan_model = f.read().strip()
 
-    artirmali_yol = f'results/cm_{kazanan_model}.png'
-    artirmasiz_yol = f'results/cm_{kazanan_model}_aug_off.png'
-
-    # Sol panel: Artırmalı matris
-    if os.path.exists(artirmali_yol):
-        img1 = Image.open(artirmali_yol)
-        axes[0].imshow(img1)
-        axes[0].set_title('Artırmalı Matris (Kazanan)')
-    else:
-        axes[0].text(0.5, 0.5, f'{artirmali_yol}\nbekleniyor...', ha='center', va='center')
-    axes[0].axis('off')
-
-    # Sağ panel: Artırmasız matris
-    if os.path.exists(artirmasiz_yol):
-        img2 = Image.open(artirmasiz_yol)
-        axes[1].imshow(img2)
-        axes[1].set_title('Artırmasız Matris (aug_off)')
-    else:
-        axes[1].text(0.5, 0.5, f'{artirmasiz_yol}\nbekleniyor...', ha='center', va='center')
-    axes[1].axis('off')
-
-    plt.tight_layout()
-    plt.savefig('results/sekil_karisiklik.png')
-    plt.close()
-    print("sekil_karisiklik.png basariyla olusturuldu (Goruntuler gelene kadar yer tutucularla).")
-
-except Exception as e:
-    print(f"Karisiklik matrisi figurleri birlestirilirken hata: {e}")
+if __name__ == "__main__":
+    for adim in (macro_f1_figuru, karisiklik_figuru):
+        try:
+            adim()
+        except Exception as hata:  # betik hata vermeden cikmali
+            print(f"{adim.__name__} sirasinda hata: {hata}")
