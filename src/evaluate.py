@@ -2,6 +2,10 @@
 
     python src/evaluate.py --model efficientnet_b0 --weights results/efficientnet_b0_best.pt --split test
     python src/evaluate.py --model efficientnet_b0 --weights results/efficientnet_b0_best.pt --split test --write-csv
+
+Asama 2: --name satir ve matris adini belirler, --tta yatay cevrilmis goruntunun
+olasiligini da ortalar (satir adina _tta eklenir). Girdi boyutu agirlik dosyasindan okunur.
+    python src/evaluate.py --model convnext_tiny --weights results/convnext_tiny_asama2.pt --name convnext_tiny_asama2 --tta --write-csv
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, recall_s
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train import ROOT, AcneSplit, get_model, get_transforms, load_cfg, read_splits  # noqa: E402
+from train import ROOT, MODEL_NAMES, AcneSplit, get_model, get_transforms, load_cfg, read_splits  # noqa: E402
 
 HEADER = [
     "model",
@@ -59,15 +63,22 @@ def upsert_csv(path: Path, values: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, choices=["resnet50", "efficientnet_b0"])
+    parser.add_argument("--model", required=True, choices=MODEL_NAMES)
     parser.add_argument("--weights", required=True)
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--csv", default="data/splits.csv")
     parser.add_argument("--image-dir", default="data/images")
     parser.add_argument("--write-csv", action="store_true")
+    parser.add_argument("--name", default=None, help="results.csv satiri ve matris adi")
+    parser.add_argument("--tta", action="store_true", help="yatay cevirme ile test sirasinda artirma")
     args = parser.parse_args()
+    if args.write_csv and args.split != "test":
+        raise SystemExit("results.csv yalniz test olcumu tutar. --write-csv ile --split test kullanin.")
 
     cfg = load_cfg()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    blob = torch.load(ROOT / args.weights, map_location=device, weights_only=False)
+    image_size = blob.get("image_size") if isinstance(blob, dict) else None
     frame = read_splits(ROOT / args.csv)
     image_dir = Path(args.image_dir)
     if not image_dir.is_absolute():
@@ -75,7 +86,7 @@ def main() -> None:
     dataset = AcneSplit(
         frame[frame.kume == args.split],
         image_dir,
-        get_transforms(False, False, cfg),
+        get_transforms(False, False, cfg, image_size),
     )
     loader = DataLoader(
         dataset,
@@ -83,9 +94,7 @@ def main() -> None:
         shuffle=False,
         num_workers=int(cfg["num_workers"]),
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model(args.model).to(device)
-    blob = torch.load(ROOT / args.weights, map_location=device, weights_only=False)
     state = blob["state_dict"] if isinstance(blob, dict) and "state_dict" in blob else blob
     model.load_state_dict(state)
     model.eval()
@@ -94,9 +103,12 @@ def main() -> None:
     y_pred = []
     with torch.no_grad():
         for images, labels in loader:
-            logits = model(images.to(device))
+            images = images.to(device)
+            probs = model(images).softmax(dim=1)
+            if args.tta:
+                probs = (probs + model(torch.flip(images, dims=[3])).softmax(dim=1)) / 2
             y_true.extend(labels.tolist())
-            y_pred.extend(logits.argmax(dim=1).cpu().tolist())
+            y_pred.extend(probs.argmax(dim=1).cpu().tolist())
 
     recalls = recall_score(y_true, y_pred, average=None, labels=LABELS, zero_division=0)
     accuracy = float(accuracy_score(y_true, y_pred))
@@ -108,7 +120,13 @@ def main() -> None:
         print(f"recall_{index} {float(value):.4f}")
 
     aug_off = "aug_off" in Path(args.weights).name
-    cm_name = f"cm_{args.model}_aug_off.png" if aug_off else f"cm_{args.model}.png"
+    tta_suffix = "_tta" if args.tta else ""
+    if args.name:
+        cm_name = f"cm_{args.name}{tta_suffix}.png"
+    else:
+        cm_name = f"cm_{args.model}_aug_off{tta_suffix}.png" if aug_off else f"cm_{args.model}{tta_suffix}.png"
+    if args.split != "test":
+        cm_name = cm_name.replace(".png", f"_{args.split}.png")
     fig, axis = plt.subplots(figsize=(4.5, 4))
     sns.heatmap(
         matrix,
@@ -132,9 +150,13 @@ def main() -> None:
         print("results.csv yazilmadi. Kalici satir icin --write-csv ekleyin.")
         return
 
-    row_name = f"{args.model}_aug_off" if aug_off else args.model
-    if row_name == f"{args.model}_aug_off":
-        row_name = "kazanan_aug_off"
+    if args.name:
+        row_name = args.name + tta_suffix
+    else:
+        row_name = f"{args.model}_aug_off" if aug_off else args.model
+        if row_name == f"{args.model}_aug_off":
+            row_name = "kazanan_aug_off"
+        row_name += tta_suffix
     epoch = blob.get("epoch", "") if isinstance(blob, dict) else ""
     minutes = ""
     if isinstance(blob, dict) and "minutes" in blob:

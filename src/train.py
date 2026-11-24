@@ -7,6 +7,10 @@ Tam egitim denemesi Google Colab T4 uzerinde yapilir. Bu makinede CUDA yoktur;
 CPU'da yalniz --limit-batches ile kisa duman testi calisir, agirlik yazilmaz.
 aug on  -> results/{model}_best.pt
 aug off -> results/{model}_aug_off.pt
+--name verilirse -> results/{name}.pt, {name}_val.json, {name}_egri.png
+
+Asama 2 (ek deney, docs/protokol_asama2.md):
+    python src/train.py --model convnext_tiny --aug guclu --image-size 384 --balanced --amp --name convnext_tiny_asama2
 """
 
 from __future__ import annotations
@@ -28,11 +32,12 @@ import torch.nn as nn
 import yaml
 from PIL import Image
 from sklearn.metrics import f1_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models, transforms
 
 ROOT = Path(__file__).resolve().parents[1]
 LABELS = [0, 1, 2, 3]
+MODEL_NAMES = ["resnet50", "efficientnet_b0", "convnext_tiny", "densenet121"]
 
 
 def load_cfg() -> dict:
@@ -50,16 +55,29 @@ def set_seed(seed: int = 42) -> None:
         torch.backends.cudnn.deterministic = True
 
 
-def get_transforms(is_train, aug_on, cfg=None):
+def get_transforms(is_train, aug_on, cfg=None, image_size=None):
+    """aug_on: True/False ya da "on" / "off" / "guclu"."""
     cfg = cfg or load_cfg()
-    size = int(cfg["image_size"])
+    size = int(image_size or cfg["image_size"])
+    mode = aug_on if isinstance(aug_on, str) else ("on" if aug_on else "off")
     normalize = transforms.Normalize(mean=cfg["mean"], std=cfg["std"])
     ops = [transforms.Resize((size, size))]
-    if is_train and aug_on:
+    if is_train and mode == "on":
         ops.extend(
             [
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(10),
+            ]
+        )
+    if is_train and mode == "guclu":
+        # Siddet etiketi lezyon sayisindan gelir: kirpma goruntunun en az %85'ini korur,
+        # renk tonu (hue) kizariklik ipucunu bozmamak icin degismez.
+        ops.extend(
+            [
+                transforms.RandomResizedCrop((size, size), scale=(0.85, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0),
             ]
         )
     ops.extend([transforms.ToTensor(), normalize])
@@ -75,7 +93,22 @@ def get_model(model_name):
         model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
         model.classifier[1] = nn.Linear(1280, 4)
         return model
+    if model_name == "convnext_tiny":
+        model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model.classifier[2] = nn.Linear(768, 4)
+        return model
+    if model_name == "densenet121":
+        model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+        model.classifier = nn.Linear(1024, 4)
+        return model
     raise ValueError("Desteklenmeyen model!")
+
+
+def balanced_sampler(frame: pd.DataFrame, seed: int) -> WeightedRandomSampler:
+    counts = frame.level.value_counts()
+    weights = torch.tensor([1.0 / counts[level] for level in frame.level], dtype=torch.double)
+    generator = torch.Generator().manual_seed(seed)
+    return WeightedRandomSampler(weights, num_samples=len(frame), replacement=True, generator=generator)
 
 
 class AcneSplit(Dataset):
@@ -120,9 +153,10 @@ def macro_f1(y_true, y_pred) -> float:
     return float(f1_score(y_true, y_pred, average="macro", labels=LABELS, zero_division=0))
 
 
-def run_epoch(model, loader, criterion, optimizer, device, limit_batches):
+def run_epoch(model, loader, criterion, optimizer, device, limit_batches, scaler=None):
     training = optimizer is not None
     model.train(training)
+    use_amp = scaler is not None
     losses = []
     y_true = []
     y_pred = []
@@ -132,12 +166,18 @@ def run_epoch(model, loader, criterion, optimizer, device, limit_batches):
         images = images.to(device)
         labels = labels.to(device)
         with torch.set_grad_enabled(training):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                logits = model(images)
+                loss = criterion(logits, labels)
             if training:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
         losses.append(float(loss.item()))
         y_true.extend(labels.detach().cpu().tolist())
         y_pred.extend(logits.argmax(dim=1).detach().cpu().tolist())
@@ -159,17 +199,23 @@ def save_curve(history, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, choices=["resnet50", "efficientnet_b0"])
-    parser.add_argument("--aug", required=True, choices=["on", "off"])
+    parser.add_argument("--model", required=True, choices=MODEL_NAMES)
+    parser.add_argument("--aug", required=True, choices=["on", "off", "guclu"])
     parser.add_argument("--split", default="data/splits.csv")
     parser.add_argument("--image-dir", default="data/images")
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--limit-batches", type=int, default=None)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--balanced", action="store_true", help="sinif dengeli ornekleme")
+    parser.add_argument("--amp", action="store_true", help="karma hassasiyet (yalniz CUDA)")
+    parser.add_argument("--name", default=None, help="cikti dosyalarinin adi")
     args = parser.parse_args()
 
     cfg = load_cfg()
-    set_seed(int(cfg["seed"]))
-    aug = args.aug == "on"
+    seed = int(cfg["seed"])
+    set_seed(seed)
+    aug = args.aug != "off"
+    image_size = int(args.image_size or cfg["image_size"])
     smoke = args.limit_batches is not None
     max_epochs = args.max_epochs or int(cfg["max_epochs"])
     if smoke and args.max_epochs is None:
@@ -184,13 +230,17 @@ def main() -> None:
 
     frame = read_splits(split_path)
     check_official_split(frame, image_dir)
-    train_ds = AcneSplit(frame[frame.kume == "train"], image_dir, get_transforms(True, aug, cfg))
-    val_ds = AcneSplit(frame[frame.kume == "val"], image_dir, get_transforms(False, False, cfg))
+    train_frame = frame[frame.kume == "train"]
+    train_ds = AcneSplit(train_frame, image_dir, get_transforms(True, args.aug, cfg, image_size))
+    val_ds = AcneSplit(frame[frame.kume == "val"], image_dir, get_transforms(False, False, cfg, image_size))
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise SystemExit("train veya val kumesi bos.")
 
     loader_kwargs = {"batch_size": int(cfg["batch_size"]), "num_workers": int(cfg["num_workers"])}
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    if args.balanced:
+        train_loader = DataLoader(train_ds, sampler=balanced_sampler(train_frame, seed), **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     if not torch.cuda.is_available() and not smoke:
@@ -199,8 +249,12 @@ def main() -> None:
             "Google Colab'da T4 GPU acip ayni komutu orada calistir."
         )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Egitim basliyor: Model={args.model}, Augmentation={args.aug}, CSV={split_path}, cihaz={device}")
+    print(
+        f"Egitim basliyor: Model={args.model}, Augmentation={args.aug}, boyut={image_size}, "
+        f"dengeli={args.balanced}, amp={args.amp}, CSV={split_path}, cihaz={device}"
+    )
     model = get_model(args.model).to(device)
+    scaler = torch.amp.GradScaler("cuda") if args.amp and device.type == "cuda" else None
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -210,8 +264,12 @@ def main() -> None:
 
     results = ROOT / "results"
     results.mkdir(parents=True, exist_ok=True)
-    stem = args.model if aug else f"{args.model}_aug_off"
-    weight_name = f"{args.model}_best.pt" if aug else f"{args.model}_aug_off.pt"
+    if args.name:
+        stem = args.name
+        weight_name = f"{args.name}.pt"
+    else:
+        stem = args.model if aug else f"{args.model}_aug_off"
+        weight_name = f"{args.model}_best.pt" if aug else f"{args.model}_aug_off.pt"
     weight_path = results / weight_name
 
     best_f1 = -1.0
@@ -222,8 +280,8 @@ def main() -> None:
     started = time.perf_counter()
 
     for epoch in range(1, max_epochs + 1):
-        loss, _ = run_epoch(model, train_loader, criterion, optimizer, device, args.limit_batches)
-        _, val_f1 = run_epoch(model, val_loader, criterion, None, device, args.limit_batches)
+        loss, _ = run_epoch(model, train_loader, criterion, optimizer, device, args.limit_batches, scaler)
+        _, val_f1 = run_epoch(model, val_loader, criterion, None, device, args.limit_batches, scaler)
         history["loss"].append(loss)
         history["f1"].append(val_f1)
         print(f"epoch {epoch} kayip {loss:.4f} val_macro_f1 {val_f1:.4f}")
@@ -240,6 +298,8 @@ def main() -> None:
                         "val_macro_f1": val_f1,
                         "model": args.model,
                         "aug": args.aug,
+                        "image_size": image_size,
+                        "balanced": args.balanced,
                     },
                     weight_path,
                 )

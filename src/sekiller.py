@@ -61,6 +61,50 @@ def macro_f1_figuru() -> None:
     print(f"sekil_macro_f1.png yazildi. Cizilen: {list(df['model'])}. Eksik: {eksik}")
 
 
+ASAMA2_MODELLER = ["resnet50", "efficientnet_b0", "convnext_tiny", "densenet121"]
+ASAMA2_SERILER = {
+    "Asama 1 (224, hafif artirma)": ("", "skyblue"),
+    "Asama 2 (384, guclu artirma, dengeli)": ("_asama2", "seagreen"),
+    "Asama 2 + TTA": ("_asama2_tta", "darkorange"),
+}
+
+
+def asama2_figuru() -> None:
+    csv_yolu = RESULTS / "results.csv"
+    if not csv_yolu.exists():
+        print("results.csv yok, sekil_asama2.png atlandi.")
+        return
+    df = pd.read_csv(csv_yolu)
+    df["macro_f1"] = pd.to_numeric(df["macro_f1"], errors="coerce")
+    skor = dict(zip(df["model"], df["macro_f1"]))
+    if not any(f"{m}_asama2" in skor for m in ASAMA2_MODELLER):
+        print("Asama 2 satiri yok, sekil_asama2.png atlandi.")
+        return
+
+    genislik = 0.27
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for i, (etiket, (ek, renk)) in enumerate(ASAMA2_SERILER.items()):
+        etiketli = False
+        for j, model in enumerate(ASAMA2_MODELLER):
+            deger = skor.get(model + ek)
+            if deger is None or pd.isna(deger):
+                continue
+            x = j + (i - 1) * genislik
+            ax.bar(x, deger, genislik, color=renk, label=None if etiketli else etiket)
+            etiketli = True
+            ax.text(x, deger + 0.01, f"{deger:.3f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(range(len(ASAMA2_MODELLER)))
+    ax.set_xticklabels(ASAMA2_MODELLER)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Test macro-F1")
+    ax.set_title("Asama 1 ve Asama 2 karsilastirmasi (test, fold 0)")
+    ax.legend(loc="upper left", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(RESULTS / "sekil_asama2.png", dpi=120)
+    plt.close(fig)
+    print("sekil_asama2.png yazildi.")
+
+
 def karisiklik_figuru() -> None:
     kazanan_yolu = RESULTS / "kazanan.txt"
     kazanan = kazanan_yolu.read_text(encoding="utf-8").strip() if kazanan_yolu.exists() else None
@@ -86,7 +130,7 @@ def karisiklik_figuru() -> None:
 
 
 if __name__ == "__main__":
-    for adim in (macro_f1_figuru, karisiklik_figuru):
+    for adim in (macro_f1_figuru, karisiklik_figuru, asama2_figuru):
         try:
             adim()
         except Exception as hata:  # betik hata vermeden cikmali
